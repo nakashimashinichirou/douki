@@ -1,0 +1,662 @@
+package com.example.genlockcamera
+
+import android.Manifest
+import android.content.ContentValues
+import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.*
+import android.media.MediaRecorder
+import android.net.Uri
+import android.os.*
+import android.provider.MediaStore
+import android.util.Log
+import android.util.Range
+import android.util.Size
+import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
+import android.view.View
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.constraintlayout.widget.ConstraintSet
+import androidx.core.app.ActivityCompat
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.NetworkInterface
+import java.util.concurrent.Executors
+
+class MainActivity : AppCompatActivity() {
+
+    // ========== UI変数 ==========
+    private lateinit var switchRole: Switch
+    private lateinit var buttonSync: Button
+    private lateinit var buttonRec: Button
+    private lateinit var buttonMark: Button
+    private lateinit var textLog: TextView
+    private lateinit var textureView: TextureView
+    private lateinit var recIndicator: View
+    private lateinit var layoutAdjust: LinearLayout
+    private lateinit var textStatus: TextView
+
+    // ========== システム定数・変数 ==========
+    private val port = 8888
+    private var isMaster = true
+    private var socket: DatagramSocket? = null
+    @Volatile private var keepListening = true
+
+    // スレッドプール
+    private val ioExecutor = Executors.newCachedThreadPool()
+
+    // 時計補正値
+    @Volatile private var clockOffset: Long = 0
+    // RTT計測値
+    @Volatile private var lastRtt: Long = 0
+
+    // カメラ・録画関連
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var mediaRecorder: MediaRecorder? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+    private var videoSize = Size(1920, 1080)
+    private var targetFpsRange: Range<Int>? = null
+    private var currentVideoUri: Uri? = null
+
+    @Volatile private var isRecording = false
+    @Volatile private var recordingStartTime: Long = 0
+    @Volatile private var isFirstFrame = false
+    
+    // 定規（起動時間オフセット）
+    private var bootTimeOffset: Long = 0
+
+    // ★追加: 録画開始時のハードウェアフレーム番号 (10秒ズレ対策)
+    @Volatile private var startFrameNumber: Long = 0
+    
+    // ★追加: 予約された同期時刻 (通信遅延対策)
+    @Volatile private var scheduledSyncTime: Long = 0
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val root = ConstraintLayout(this).apply { id = View.generateViewId() }
+        setContentView(root)
+        
+        setupCustomUI(root)
+
+        Thread.setDefaultUncaughtExceptionHandler { _, throwable ->
+            saveDebugLog("CRASH: ${throwable.message}")
+        }
+
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO, Manifest.permission.WRITE_EXTERNAL_STORAGE), 101)
+        }
+
+        updateUIState()
+        startRxServer()
+    }
+
+    // ========== ロジック: 超高精度NTP同期 ==========
+
+    private fun startSyncProcess() {
+        if (isMaster) return
+        ioExecutor.execute {
+            runOnUiThread { log("同期開始: 精密計測...") }
+            lastRtt = 0
+            repeat(100) {
+                val myNano = System.nanoTime()
+                sendUdpSignal("TIME_REQ:$myNano")
+                Thread.sleep(100)
+            }
+        }
+    }
+
+    // ========== 受信メッセージ処理 ==========
+
+    private fun handleMessage(msg: String) {
+        val nowNano = System.nanoTime()
+        val nowWall = System.currentTimeMillis()
+        
+        // ★修正: 予約同期信号 (SYNC_RESERVE:時刻) を受信
+        if (msg.startsWith("SYNC_RESERVE:")) {
+            try {
+                val targetTime = msg.substring(13).toLong()
+                // ここでターゲット時刻をセットし、カメラコールバックで監視を開始する
+                scheduledSyncTime = targetTime
+                
+                runOnUiThread { 
+                    textStatus.text = "SYNC待機中..." 
+                    textStatus.setTextColor(Color.MAGENTA)
+                    log("予約受信: Target=$targetTime")
+                }
+            } catch(e: Exception) {
+                logError("予約解析エラー")
+            }
+        }
+    
+        if (isMaster) {
+            if (msg.startsWith("TIME_REQ:")) {
+                val clientNano = msg.substring(9)
+                sendUdpSignal("TIME_RES:$clientNano:$nowWall")
+            }
+        } else {
+            if (msg.startsWith("TIME_RES:")) {
+                try {
+                    val parts = msg.split(":")
+                    if (parts.size == 3) {
+                        val t1_Nano = parts[1].toLong()
+                        val t2_Wall = parts[2].toLong()
+                        val t4_Nano = nowNano
+                        
+                        val rttMillis = (t4_Nano - t1_Nano) / 1_000_000.0
+                        val oneWayDelay = rttMillis / 2.0
+
+                        if (lastRtt == 0L || rttMillis.toLong() < lastRtt) {
+                            lastRtt = rttMillis.toLong()
+                            clockOffset = (t2_Wall + oneWayDelay).toLong() - nowWall
+                            
+                            runOnUiThread {
+                                val rttStr = String.format("%.2f", rttMillis)
+                                textStatus.text = "同期完了\nRTT: ${rttStr}ms"
+                                textStatus.setTextColor(Color.GREEN)
+                                log("同期更新: RTT=$rttStr")
+                            }
+                        }
+                    }
+                } catch(e: Exception) {}
+            }
+        }
+    }
+
+    // ========== ボタンアクション ==========
+
+    private fun onRecButtonClicked() {
+        if (!isRecording) {
+            try {
+                closeSession()
+                setupMediaRecorder()
+                startHighSpeedSession()
+            } catch(e: Exception) {
+                logError("録画開始失敗: ${e.message}")
+            }
+        } else {
+            stopRecording()
+        }
+    }
+
+    // ========== UI構築 (レイアウト定義) ==========
+
+    private fun setupCustomUI(root: ConstraintLayout) {
+        textureView = TextureView(this).apply {
+            id = View.generateViewId()
+            layoutParams = ConstraintLayout.LayoutParams(
+                ConstraintLayout.LayoutParams.MATCH_PARENT,
+                ConstraintLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+        root.addView(textureView)
+
+        textLog = TextView(this).apply { 
+            id = View.generateViewId()
+            setBackgroundColor(Color.parseColor("#80000000"))
+            setTextColor(Color.GREEN)
+            textSize = 10f
+            layoutParams = ConstraintLayout.LayoutParams(0, 300)
+        }
+        root.addView(textLog)
+
+        layoutAdjust = LinearLayout(this).apply {
+            id = View.generateViewId()
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(Color.parseColor("#80000000"))
+            setPadding(20, 20, 20, 20)
+        }
+        textStatus = TextView(this).apply {
+            text = "未同期"
+            setTextColor(Color.YELLOW)
+            textSize = 24f
+            gravity = Gravity.CENTER
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        layoutAdjust.addView(textStatus)
+        root.addView(layoutAdjust)
+
+        switchRole = Switch(this).apply {
+            id = View.generateViewId()
+            text = "親機モード"
+            isChecked = true
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#40000000"))
+            setPadding(20, 10, 20, 10)
+        }
+        root.addView(switchRole)
+
+        buttonSync = Button(this).apply {
+            id = View.generateViewId()
+            text = "SYNC (子機のみ)"
+        }
+        root.addView(buttonSync)
+
+        buttonRec = Button(this).apply {
+            id = View.generateViewId()
+            text = "START REC"
+            setBackgroundColor(Color.RED)
+            setTextColor(Color.WHITE)
+        }
+        root.addView(buttonRec)
+
+        buttonMark = Button(this).apply {
+            id = View.generateViewId()
+            text = "MARK SYNC"
+            setBackgroundColor(Color.MAGENTA)
+            setTextColor(Color.WHITE)
+        }
+        root.addView(buttonMark)
+
+        recIndicator = View(this).apply {
+            layoutParams = ConstraintLayout.LayoutParams(0, 0)
+            setBackgroundColor(Color.RED)
+            visibility = View.GONE
+            alpha = 0.3f
+        }
+        addContentView(recIndicator, recIndicator.layoutParams)
+
+        val set = ConstraintSet()
+        set.clone(root)
+        
+        // レイアウト接続 (省略なし)
+        set.connect(textureView.id, ConstraintSet.TOP, ConstraintSet.PARENT_ID, ConstraintSet.TOP)
+        set.connect(textureView.id, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM)
+        set.connect(textureView.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
+        set.connect(textureView.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+
+        set.connect(textLog.id, ConstraintSet.TOP, ConstraintSet.PARENT_ID, ConstraintSet.TOP, 20)
+        set.connect(textLog.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
+        set.connect(textLog.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+
+        set.connect(layoutAdjust.id, ConstraintSet.TOP, textLog.id, ConstraintSet.BOTTOM, 50)
+        set.connect(layoutAdjust.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
+        set.connect(layoutAdjust.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+
+        set.connect(buttonRec.id, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM, 400)
+        set.connect(buttonRec.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START, 50)
+        set.connect(buttonRec.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END, 50)
+
+        set.connect(buttonMark.id, ConstraintSet.BOTTOM, buttonRec.id, ConstraintSet.TOP, 150)
+        set.connect(buttonMark.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START, 100)
+        set.connect(buttonMark.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END, 100)
+
+        set.connect(buttonSync.id, ConstraintSet.BOTTOM, buttonMark.id, ConstraintSet.TOP, 150)
+        set.connect(buttonSync.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START, 100)
+        set.connect(buttonSync.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END, 100)
+
+        set.connect(switchRole.id, ConstraintSet.BOTTOM, buttonSync.id, ConstraintSet.TOP, 150)
+        set.connect(switchRole.id, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
+        set.connect(switchRole.id, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+
+        set.applyTo(root)
+
+        switchRole.setOnCheckedChangeListener { _, checked ->
+            isMaster = checked
+            updateUIState()
+        }
+        buttonSync.setOnClickListener { startSyncProcess() }
+        buttonRec.setOnClickListener { onRecButtonClicked() }
+        
+        buttonMark.setOnClickListener {
+            if (isMaster) {
+                // ★修正: 親機は即時送信せず、「2秒後」を予約して全員に伝える
+                val now = System.currentTimeMillis() + clockOffset
+                val targetTime = now + 2000 // 2秒後に一斉マーク
+                
+                // 自分自身も予約セット
+                scheduledSyncTime = targetTime
+                
+                sendUdpSignal("SYNC_RESERVE:$targetTime")
+                log("送信: 予約 $targetTime")
+                
+                runOnUiThread { 
+                    textStatus.text = "予約送信中..." 
+                    textStatus.setTextColor(Color.CYAN)
+                }
+            } else {
+                Toast.makeText(this, "親機モードでのみ有効です", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun updateUIState() {
+        if (isMaster) {
+            buttonSync.visibility = View.GONE
+            buttonRec.visibility = View.VISIBLE
+            textStatus.text = "MASTER"
+            textStatus.setTextColor(Color.CYAN)
+            buttonMark.alpha = 1.0f
+        } else {
+            buttonSync.visibility = View.VISIBLE
+            buttonRec.visibility = View.VISIBLE
+            textStatus.text = "SLAVE (待機)"
+            textStatus.setTextColor(Color.LTGRAY)
+            buttonMark.alpha = 0.5f
+        }
+    }
+
+    // ========== カメラ・録画機能 ==========
+
+    override fun onResume() {
+        super.onResume()
+        bootTimeOffset = System.currentTimeMillis() - SystemClock.elapsedRealtime()
+        startBackgroundThread()
+
+        if (textureView.isAvailable) {
+            openCamera()
+        } else {
+            textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) { openCamera() }
+                override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {}
+                override fun onSurfaceTextureDestroyed(s: SurfaceTexture) = true
+                override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
+            }
+        }
+    }
+    
+    override fun onPause() {
+        closeCamera()
+        stopBackgroundThread()
+        super.onPause()
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        ioExecutor.shutdown()
+        socket?.close()
+    }
+
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("CameraBackground").also { it.start() }
+        backgroundHandler = Handler(backgroundThread!!.looper)
+    }
+
+    private fun stopBackgroundThread() {
+        backgroundThread?.quitSafely()
+        try { backgroundThread?.join() } catch (e: InterruptedException) {}
+        backgroundThread = null; backgroundHandler = null
+    }
+
+    private fun openCamera() {
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+
+            val cameraId = manager.cameraIdList[0]
+            val characteristics = manager.getCameraCharacteristics(cameraId)
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val ranges = map?.getHighSpeedVideoFpsRangesFor(videoSize)
+            
+            targetFpsRange = ranges?.firstOrNull { it.lower >= 120 } ?: ranges?.firstOrNull { it.lower >= 60 }
+
+            manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    createPreviewSession()
+                }
+                override fun onDisconnected(camera: CameraDevice) { camera.close(); cameraDevice = null }
+                override fun onError(camera: CameraDevice, error: Int) { camera.close(); cameraDevice = null }
+            }, backgroundHandler)
+        } catch (e: Exception) { 
+            runOnUiThread { logError("カメラ起動失敗: ${e.message}") }
+        }
+    }
+
+    private fun createPreviewSession() {
+        if (cameraDevice == null) return
+        try {
+            val texture = textureView.surfaceTexture!!
+            texture.setDefaultBufferSize(videoSize.width, videoSize.height)
+            val surface = Surface(texture)
+            val builder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            builder.addTarget(surface)
+            cameraDevice!!.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                    builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
+                    session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+                }
+                override fun onConfigureFailed(session: CameraCaptureSession) {}
+            }, null)
+        } catch(e: Exception) {}
+    }
+
+    private fun setupMediaRecorder() {
+        mediaRecorder = MediaRecorder()
+        val fileName = "Genlock_${System.currentTimeMillis()}"
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "$fileName.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/GenlockVideo")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        currentVideoUri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+        val pfd = contentResolver.openFileDescriptor(currentVideoUri!!, "w")
+        
+        mediaRecorder?.apply {
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setOutputFile(pfd!!.fileDescriptor)
+            setVideoEncodingBitRate(5_000_000)
+            setVideoFrameRate(30)
+            setVideoSize(videoSize.width, videoSize.height)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            if (targetFpsRange != null) setCaptureRate(targetFpsRange!!.upper.toDouble())
+            prepare()
+        }
+    }
+
+    private fun startHighSpeedSession() {
+        try {
+            if (cameraDevice == null || mediaRecorder == null) return
+            val texture = textureView.surfaceTexture!!
+            texture.setDefaultBufferSize(videoSize.width, videoSize.height)
+            val previewSurface = Surface(texture)
+            val recorderSurface = mediaRecorder!!.surface
+            
+            mediaRecorder?.start()
+            isRecording = true
+            isFirstFrame = true
+            recordingStartTime = 0
+
+            runOnUiThread {
+                recIndicator.visibility = View.VISIBLE
+                if (isMaster) buttonRec.text = "STOP REC"
+                textStatus.text = "● REC"
+                textStatus.setTextColor(Color.RED)
+            }
+
+            cameraDevice!!.createConstrainedHighSpeedCaptureSession(listOf(previewSurface, recorderSurface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    val highSpeedSession = session as? CameraConstrainedHighSpeedCaptureSession ?: return
+                    captureSession = highSpeedSession
+                    val builder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                    builder.addTarget(previewSurface)
+                    builder.addTarget(recorderSurface)
+                    builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetFpsRange)
+                    
+                    val list = highSpeedSession.createHighSpeedRequestList(builder.build())
+                    highSpeedSession.setRepeatingBurst(list, object : CameraCaptureSession.CaptureCallback() {
+                        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                            // 現在のハードウェアフレーム番号を取得
+                            val currentRawFrame = result.frameNumber
+
+                            if (isFirstFrame) {
+                                isFirstFrame = false
+                                // ★修正: 録画開始時のフレーム番号を記憶 (0フレーム目基準)
+                                startFrameNumber = currentRawFrame
+
+                                val sensorTime = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: SystemClock.elapsedRealtimeNanos()
+                                val sensorTimeMs = sensorTime / 1_000_000
+                                recordingStartTime = sensorTimeMs + bootTimeOffset + clockOffset
+                                
+                                runOnUiThread { log("Start Time: $recordingStartTime") }
+                                val startLog = "Start: $recordingStartTime"
+                                saveTimestampSafe("Timestamp_${System.currentTimeMillis()}.txt", startLog)
+                            }
+                            
+                            // ★修正: 予約時刻による同期処理 (Latency Free)
+                            if (scheduledSyncTime > 0) {
+                                val sensorTimeNano = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: SystemClock.elapsedRealtimeNanos()
+                                val sensorTimeMs = sensorTimeNano / 1_000_000
+                                val currentFrameTime = sensorTimeMs + bootTimeOffset + clockOffset
+
+                                // 予約時刻を過ぎた瞬間にトリガー
+                                if (currentFrameTime >= scheduledSyncTime) {
+                                    val target = scheduledSyncTime
+                                    scheduledSyncTime = 0 // 1回だけ実行
+
+                                    // ★修正: 相対フレーム番号 (ファイル先頭からの位置) を計算
+                                    val relativeFrame = currentRawFrame - startFrameNumber
+                                    // 万が一0未満なら0にする
+                                    val finalFrame = if (relativeFrame < 0) 0 else relativeFrame
+
+                                    val logMsg = "SYNC_POINT: Frame=$finalFrame, Time=$currentFrameTime (Target=$target)"
+                                    
+                                    runOnUiThread { 
+                                        log(logMsg) 
+                                        textStatus.text = "SYNC完了!"
+                                        textStatus.setTextColor(Color.GREEN)
+                                    }
+                                    saveTimestampSafe("SyncMark_${System.currentTimeMillis()}.txt", logMsg)
+                                }
+                            }
+                        }
+                    }, backgroundHandler)
+                }
+                override fun onConfigureFailed(session: CameraCaptureSession) {}
+            }, backgroundHandler)
+        } catch (e: Exception) {
+            runOnUiThread { logError("開始失敗: ${e.message}") }
+            isRecording = false
+        }
+    }
+
+    private fun stopRecording() {
+        if (!isRecording) return
+        
+        runOnUiThread {
+            textStatus.text = "保存中..."
+            textStatus.setTextColor(Color.YELLOW)
+        }
+        
+        ioExecutor.execute {
+            try {
+                isRecording = false
+                captureSession?.stopRepeating()
+                captureSession?.abortCaptures()
+                mediaRecorder?.stop()
+                mediaRecorder?.reset()
+                if (currentVideoUri != null) {
+                    val values = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                    contentResolver.update(currentVideoUri!!, values, null, null)
+                    currentVideoUri = null
+                }
+                
+                runOnUiThread {
+                    recIndicator.visibility = View.GONE
+                    if (isMaster) buttonRec.text = "START REC"
+                    textStatus.text = "保存完了！"
+                    textStatus.setTextColor(Color.GREEN)
+                    Toast.makeText(this@MainActivity, "ファイル保存完了", Toast.LENGTH_SHORT).show()
+                }
+                createPreviewSession()
+            } catch (e: Exception) {
+                runOnUiThread { logError("停止エラー: ${e.message}") }
+            }
+        }
+    }
+
+    // ========== ファイル保存 ==========
+    
+    private fun saveTimestampSafe(fileName: String, content: String) {
+        ioExecutor.execute {
+            saveToMediaStore(fileName, content) 
+        }
+    }
+
+    private fun saveToMediaStore(fileName: String, content: String) {
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return
+            contentResolver.openOutputStream(uri).use { it?.write(content.toByteArray()) }
+        } catch (e: Exception) { 
+            runOnUiThread { logError("保存失敗") }
+        }
+    }
+
+    private fun saveDebugLog(msg: String) {
+        Log.e("GenlockDebug", msg)
+    }
+
+    // ========== 通信基本部分 ==========
+    
+    private fun sendUdpSignal(message: String) {
+        ioExecutor.execute {
+            try {
+                val s = DatagramSocket()
+                s.broadcast = true
+                val data = message.toByteArray()
+                val ifaces = NetworkInterface.getNetworkInterfaces()
+                while (ifaces.hasMoreElements()) {
+                    val iface = ifaces.nextElement()
+                    if (iface.isLoopback || !iface.isUp) continue
+                    iface.interfaceAddresses.forEach { addr ->
+                        if (addr.broadcast != null) {
+                            try { s.send(DatagramPacket(data, data.size, addr.broadcast, port)) } catch(e:Exception){}
+                        }
+                    }
+                }
+                s.close()
+            } catch(e:Exception){}
+        }
+    }
+
+    private fun startRxServer() {
+        val rxThread = Thread {
+            try {
+                if (socket == null || socket!!.isClosed) socket = DatagramSocket(port)
+                val buf = ByteArray(1024)
+                val pkt = DatagramPacket(buf, buf.size)
+                while (keepListening) {
+                    socket?.receive(pkt)
+                    val msg = String(pkt.data, 0, pkt.length)
+                    runOnUiThread { handleMessage(msg) }
+                }
+            } catch(e:Exception){}
+        }
+        rxThread.start()
+    }
+    
+    // ========== 共通 ==========
+    private fun closeCamera() { 
+        try {
+            captureSession?.close(); captureSession = null
+            cameraDevice?.close(); cameraDevice = null
+            mediaRecorder?.release(); mediaRecorder = null
+        } catch(e:Exception){}
+    }
+    
+    private fun closeSession() { 
+        try { captureSession?.close(); captureSession = null } catch(e:Exception){}
+    }
+
+    private fun log(text: String) {
+        val ts = System.currentTimeMillis() % 10000
+        textLog.text = "[$ts] $text\n${textLog.text}"
+    }
+    private fun logError(text: String) { log("ERR: $text") }
+}
